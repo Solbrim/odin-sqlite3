@@ -7,6 +7,8 @@ import "base:runtime"
 import "core:reflect"
 import "core:fmt"
 import "core:mem"
+import "core:time/datetime"
+import "core:strings"
 
 DB :: sqlite.Sqlite3
 Query :: sqlite.Stmt
@@ -37,6 +39,12 @@ sql_exec :: proc(db: ^DB, sql: string, args: ..any) -> (Status) {
     for _ in sql_row(db, query, struct {}) {
     }
     return .Ok
+}
+
+_datetime_to_i64 :: proc(using dt: ^datetime.DateTime) -> i64
+{
+    res := datetime.components_to_time
+    return 0;
 }
 
 sql_bind :: proc(db: ^DB, sql: string, args: ..any) -> (^Query, Status) {
@@ -74,15 +82,16 @@ sql_bind :: proc(db: ^DB, sql: string, args: ..any) -> (^Query, Status) {
                 assert(ok)
                 status = sqlite.bind_int(query, arg_idx, cast(i32) value)
             case runtime.Type_Info_Array:
-                if arg_variant.elem != u8 { fmt.panicf("Unsupported bind type", arg_variant) }
-                value := reflect.as_bytes(arg)
-                status = sqlite.bind_blob(statement.handle, arg_idx, raw_data(value), cast(i32) len(value), nil)
+                fmt.panicf("Unsupported bind type", arg_variant)
+                // if arg_variant.elem != u8 {  }
+                // value := reflect.as_bytes(arg)
+                // status = sqlite.bind_blob(statement.handle, arg_idx, raw_data(value), cast(i32) len(value), nil)
         }
     }
     return query, nil
 }
 
-sql_row :: proc(db: ^DB, query: ^Query, $T: typeid) -> (T, bool)
+sql_row :: proc(db: ^DB, query: ^Query, $T: typeid, allocator := context.allocator) -> (T, bool)
 where
     intrinsics.type_is_struct(T)
 {
@@ -103,6 +112,7 @@ where
     for field, field_idx in struct_info.types[:struct_info.field_count] {
         col_idx := cast(i32) field_idx
         col_type := sqlite.column_type(query, col_idx)
+        field_name := struct_info.names[field_idx]
         field_base := runtime.type_info_base(field)
         field_offs := struct_info.offsets[field_idx]
         if un, ok := field_base.variant.(runtime.Type_Info_Union); ok {
@@ -111,6 +121,7 @@ where
             }
             field_base = un.variants[0]
         }
+
         #partial switch field_variant in field_base.variant {
             case runtime.Type_Info_Any:
             case runtime.Type_Info_Boolean:
@@ -186,24 +197,52 @@ where
                     panic("Only enum integer sizes of 1, 2, 4 and 8 bytes are supported")
                 }
             case runtime.Type_Info_String:
-                if col_type != .Text {
-                    fmt.panicf("Type mismatch: %v <- %v", typeid_of(type_of(field_variant)), col_type)
+                if col_type != .Text && col_type != .Null {
+                    fmt.panicf("Type mismatch (%s): %v <- %v", field_name, typeid_of(type_of(field_variant)), col_type)
                 }
-                value := sqlite.column_text(query, col_idx)
+                value := sqlite.column_text(query, col_idx) if col_type != .Null else ""
+
+                // put the string and cstring into the buffer; clone the internal string and cstring buffers to avoid the dating being freed if DB or query is deleted.
+                //     Q: check that this is actually the reason, or if it's just an issue of strings/cstrings being stored on the stack and not implicit copied when moved around.
                 if field_variant.is_cstring {
-                    (transmute(^cstring)  &t_bytes[field_offs])^ = value
+                    (transmute(^cstring) &t_bytes[field_offs])^ = strings.clone_to_cstring(string(value), allocator)
                 } else {
-                    (transmute(^string)  &t_bytes[field_offs])^ = cast(string) value
+                    (transmute(^string) &t_bytes[field_offs])^ = strings.clone(string(value), allocator)
                 }
             case runtime.Type_Info_Array:
-                if col_type != .Blob {
-                    fmt.panicf("Type mismatch: %v <- %v", typeid_of(type_of(field_variant)), col_type)
-                }
-                len := int(sqlite.column_bytes(statement.handle, col_idx))
-                value := sqlite.column_blob(statement.handle, col_idx)
-                mem.copy((transmute(^rawptr) &t_bytes[field_offs]), value, len)
+                // Arrays are not supported by SQLite
+
+                fmt.panicf("Unsupported bind type", col_type)
+                // if col_type != .Blob {
+                //     fmt.panicf("Type mismatch: %v <- %v", typeid_of(type_of(field_variant)), col_type)
+                // }
+                // len := int(sqlite.column_bytes(statement.handle, col_idx))
+                // value := sqlite.column_blob(statement.handle, col_idx)
+                // mem.copy((transmute(^rawptr) &t_bytes[field_offs]), value, len)
+            case runtime.Type_Info_Struct:
+                // TODO: leaving here for later until I figure out what I want to do with it.
+                //      It seems like DateTime should just be stored as a formatter Text-strings
+
+                // if (field.id == typeid_of(datetime.DateTime))
+                // {
+                //     if (col_type != .Null)
+                //     {
+                //         raw_value := sqlite.column_int64(query, col_idx)
+                //         value, err := datetime.ordinal_to_datetime(raw_value);
+
+                //         (transmute(^datetime.DateTime) &t_bytes[field_offs])^ = value
+
+                //         fmt.panicf("DateTime raw: %v parsed: %v err?: %v", raw_value, value, err)
+                //     } else
+                //     {
+                //         (transmute(^datetime.DateTime) &t_bytes[field_offs])^ = datetime.DateTime {}
+                //     }
+                // } else
+                // {
+                //     fmt.panicf("Unsupported Type_Info_Struct type for accepting SQL values in the given struct (%s). Only accepting DateTime", field_name)
+                // }
             case:
-                panic("Unsupported type for accepting SQL values in the given struct")
+                fmt.panicf("Unsupported type for accepting SQL values in the given struct (%s) %v %s <- %v", field_name, typeid_of(type_of(field_base.variant)), col_type)
         }
     }
     return t, true

@@ -1,3 +1,4 @@
+
 *.obj
 *.lib
 *.exe
@@ -5,5 +6,8 @@
 *.o
 *.a
 *.so
-
 ols.json
+# ctags
+tags.temp
+tags
+
